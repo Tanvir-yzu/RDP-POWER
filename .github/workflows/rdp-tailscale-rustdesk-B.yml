@@ -1,11 +1,11 @@
+# rdp-tailscale-B.yml
 name: RDP + Tailscale + RustDesk + (Optional) Chrome Remote Desktop (B)
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:         { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
-      ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
+      # API keys / authkeys MUST be configured as repository secrets (see top of file comments).
       quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
       runtime_minutes:    { description: "Runtime (max 360; default 355 when not test)", required: false, default: "355" }
       do_purge:           { description: "Purge bullet* devices at start (single instance only)", required: false, default: "true" }
@@ -13,18 +13,14 @@ on:
       rdp_count:          { description: "How many RDP instances (1-10) [ignored if CRD provided]", required: false, default: "1" }
       crd_code:
         description: >-
-          Paste raw CRD code (4/0AV...), full PowerShell command, or text/URL containing --code="4/...".
-          If provided -> single instance; CRD launches first.
+          Optional CRD short code only (format 4/...). Full commands are NOT allowed for safety.
         required: false
         default: ""
-      crd_pin:
-        description: "CRD PIN (6–12 digits). Used when launching CRD to avoid interactive prompt."
-        required: false
-        default: "123456"
+    # restrict who can run this workflow at repo settings if possible
 
 permissions:
   contents: read
-  actions: write
+  actions: write     # keep minimal; if not needed for dispatch, remove or tighten
 
 defaults:
   run:
@@ -61,12 +57,17 @@ jobs:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
     timeout-minutes: 370
+
     env:
+      # Non-secret defaults; secrets are read from repo secrets below when needed.
       RDP_USER: Bullettemporary
-      RDP_PASS: Bullet@12345
+      TS_TAILNET: ${{ inputs.ts_tailnet }}
+      # DO NOT put secrets here or write them to logs.
+      # Provide these as repository secrets:
+      # secrets.TS_AUTHKEY, secrets.TS_API_KEY, secrets.CRD_PIN, secrets.RDP_PASSWORD
 
     steps:
-      - name: Set CRD flag early (safe read)
+      - name: Set CRD flag (safe read)
         run: |
           $crd = @'
           ${{ inputs.crd_code }}
@@ -105,37 +106,36 @@ jobs:
             Write-Host "CRD host already installed."
           }
 
-      - name: Run Chrome Remote Desktop (accept raw code / full cmd / url) with PIN
+      - name: Run Chrome Remote Desktop (ACCEPT ONLY short 4/... code) with PIN
         if: env.CRD_ENABLED == '1'
+        env:
+          CRD_PIN_SECRET: ${{ secrets.CRD_PIN }}   # must be stored as repo secret
         run: |
           $raw = @'
           ${{ inputs.crd_code }}
           '@.Trim()
-          $pin = "${{ inputs.crd_pin }}".Trim()
-          if ($pin -notmatch '^\d{6,12}$') { Write-Error "crd_pin must be 6–12 digits."; exit 1 }
+          $pin = (Get-Item -Path Env:CRD_PIN_SECRET).Value
+          if (-not $pin) { Write-Error "CRD_PIN secret is not set in repository secrets."; exit 1 }
+          if ($pin -notmatch '^\d{6,12}$') { Write-Error "CRD_PIN secret must be 6–12 digits."; exit 1 }
 
           $starter = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $starter)) { Write-Error "remoting_start_host.exe not found."; exit 1 }
 
-          $isFull = $false; $code = $null
-          if ($raw -match 'remoting_start_host\.exe') { $isFull = $true }
-          if ($raw -match '--code\s*=\s*"?([^"\s]+)') { $code = ([regex]::Match($raw,'--code\s*=\s*"?([^"\s]+)')).Groups[1].Value }
-          elseif ($raw -match '^4\/') { $code = $raw }
+          # SAFETY: only accept the short 4/... style code or a string containing --code="4/..."
+          $code = $null
+          if ($raw -match '^(4\/[A-Za-z0-9\-_]+)$') { $code = $Matches[1] }
+          elseif ($raw -match '--code\s*=\s*"?((4\/[A-Za-z0-9\-_]+))') { $code = $Matches[1] }
 
-          if ($code) {
-            $redir = "https://remotedesktop.google.com/_/oauthredirect"
-            $name  = $Env:COMPUTERNAME
-            $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""","--pin=""$pin""")
-            Start-Process -FilePath $starter -ArgumentList $args
-          } elseif ($isFull) {
-            $tmp = "$env:TEMP\crd_full.ps1"
-            Set-Content -Path $tmp -Value $raw -Encoding UTF8
-            powershell -ExecutionPolicy Bypass -File $tmp
-          } else {
-            Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=\"4/...\""
+          if (-not $code) {
+            Write-Error "CRD input rejected: only short codes of form 4/... or values containing --code=\"4/...\" are accepted."
             exit 1
           }
-          Write-Host "CRD launch step completed with PIN."
+
+          $redir = "https://remotedesktop.google.com/_/oauthredirect"
+          $name  = $Env:COMPUTERNAME
+          $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""","--pin=""$pin""")
+          Start-Process -FilePath $starter -ArgumentList $args
+          Write-Host "CRD launch step triggered (short code)."
 
       - name: Verify CRD registration (service + recent logs)
         if: env.CRD_ENABLED == '1'
@@ -174,12 +174,16 @@ jobs:
 
       - name: Purge bullet* devices (single-instance only)
         if: ${{ needs.setup.outputs.multi == '0' }}
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}   # must be a repo secret
+          TS_TAILNET: ${{ inputs.ts_tailnet }}
         run: |
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           if (Yes("${{ inputs.do_purge }}")) {
+            if (-not $env:TS_API_KEY) { Write-Warning "TS_API_KEY secret not set; skipping purge."; exit 0 }
             try {
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-              $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:TS_API_KEY):"))
+              $tn = [uri]::EscapeDataString("$($env:TS_TAILNET)")
               $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
               foreach($d in $list.devices){
                 if ($d.hostname -match '^bullet[0-9]*$'){
@@ -192,39 +196,50 @@ jobs:
             Write-Host "Purge disabled."
           }
 
-      - name: Install + Up Tailscale
+      - name: Install + Up Tailscale (safe flags)
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}   # must be a repo secret (device-limited or ephemeral)
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $ts)) {
+            # consider updating version or using winget; verify checksum if possible
             $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
             $dst = "$env:TEMP\tailscale.msi"
             Invoke-WebRequest -Uri $url -OutFile $dst
             Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
             Remove-Item $dst -Force
           }
+          if (-not $env:TS_AUTHKEY) { Write-Error "TS_AUTHKEY secret not set in repository secrets."; exit 1 }
           & $ts logout | Out-Null
-          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
-          $ip4 = & $ts ip -4 | Select-Object -First 1
-          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Tailscale IPv4: $ip4"
 
-      - name: Enable RDP user + firewall
+          # SAFETY: Do not accept routes/DNS by default. Remove --accept-routes and --accept-dns unless you need them.
+          & $ts up --authkey "${env:TS_AUTHKEY}" --hostname "$env:TS_HOSTNAME"
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          if ($ip4) { "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV }
+          Write-Host "Tailscale started (IP may be masked for security)."
+
+      - name: Enable RDP user + firewall (non-admin user, password from secrets)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}   # must be set as a repo secret
         run: |
-          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          if (-not $env:RDP_PASSWORD) { Write-Error "RDP_PASSWORD secret is not set."; exit 1 }
+          $u=$env:RDP_USER; $p=$env:RDP_PASSWORD
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
             New-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member $u
+            # Use least privilege: add to Remote Desktop Users only, avoid Administrators.
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
           } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Set-LocalUser -Name $u -Password $sec
             Enable-LocalUser -Name $u
-            Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
           }
+          # Enable RDP and NLA
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          # Ensure Network Level Authentication is required for RDP sessions
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          Write-Host "RDP ready. user=$u pass=$p host=$env:TS_HOSTNAME ip=$env:TAILSCALE_IP"
+          Write-Host "RDP user ready. user=$u (password provided in repo secrets)."
 
       - name: Install Python libs (pyautogui/pynput/pillow)
         run: |
@@ -232,7 +247,7 @@ jobs:
           python -m pip install --force-reinstall pyautogui pynput pillow
           python -c "import pyautogui, pynput, PIL; print('Python libs OK')"
 
-      - name: Install RustDesk
+      - name: Install RustDesk (validate installer if possible)
         run: |
           $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
           if (-not (Test-Path $rdExe)) {
@@ -240,6 +255,7 @@ jobs:
               $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi"
               $installerPath = "$env:TEMP\rustdesk.msi"
               Invoke-WebRequest -Uri $rdUrl -OutFile $installerPath
+              # TODO: Validate SHA256 here if you have a known-good value.
               Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
               Remove-Item $installerPath -Force
             } catch {
@@ -250,18 +266,21 @@ jobs:
           if (-not (Test-Path $rdExe)) { Write-Error "RustDesk not found after install"; exit 1 }
           Write-Host "RustDesk installed."
 
-      - name: Open RustDesk ports (TCP 21115-21119, UDP 21116)
+      - name: Open RustDesk ports (TCP 21115-21119, UDP 21116) restricted to Tailscale network
         run: |
+          # Limit inbound rules to the Tailscale subnet to avoid exposing to public internet
+          $tailscaleNet = "100.64.0.0/10"
           for ($p=21115; $p -le 21119; $p++) {
             $name = "APP-PORT-TCP-$p"
             netsh advfirewall firewall delete rule name=$name 2>$null
-            netsh advfirewall firewall add rule name=$name dir=in action=allow protocol=TCP localport=$p
+            netsh advfirewall firewall add rule name=$name dir=in action=allow protocol=TCP localport=$p remoteip=$tailscaleNet
           }
           $udpName = "APP-PORT-UDP-21116"
           netsh advfirewall firewall delete rule name=$udpName 2>$null
-          netsh advfirewall firewall add rule name=$udpName dir=in action=allow protocol=UDP localport=21116
+          netsh advfirewall firewall add rule name=$udpName dir=in action=allow protocol=UDP localport=21116 remoteip=$tailscaleNet
+          Write-Host "Firewall rules added limited to $tailscaleNet"
 
-      - name: Launch RustDesk (foreground) + Screenshot to Gofile
+      - name: Launch RustDesk (foreground) + take screenshot (artifact)
         run: |
           $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
           Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
@@ -276,10 +295,14 @@ jobs:
           $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
           $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
           $graphics.Dispose(); $bitmap.Dispose()
+          Write-Host "Screenshot saved to $screenshotPath"
+        # upload artifact in a separate step (actions/upload-artifact can't be run inside PS)
 
-          $curlResult = curl -F "file=@$screenshotPath" https://store1.gofile.io/uploadFile
-          $json = $curlResult | ConvertFrom-Json
-          if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-screenshot-${{ matrix.id }}
+          path: ${{ runner.temp }}/rustdesk_${{ matrix.id }}.png
 
       - name: Keep alive (to ${{ env.RUNTIME_MINUTES }} mins)
         run: |
@@ -287,37 +310,36 @@ jobs:
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
             $mode = if ("$env:CRD_ENABLED" -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
-            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
+            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss"))
             Start-Sleep -Seconds 60
           }
 
-      - name: Dispatch next or stop
+      - name: Dispatch next or stop (no secrets in payload)
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_PAT || github.token }}
         run: |
+          # NOTE: We intentionally do NOT put any secrets in the dispatch payload.
+          # The downstream workflow must read secrets from its repository secrets.
           $cycles = [int]"${{ inputs.cycles }}"
           if ($cycles -gt 0) {
             $next = $cycles - 1
             if ($next -le 0) {
               $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
               $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-              $payload = @{ ts_tailnet="${{ inputs.ts_tailnet }}"; ts_api_key="${{ inputs.ts_api_key }}"; base_prefix="bullet"; max_count="10"; dry_run="false" }
+              $payload = @{ ts_tailnet="${{ inputs.ts_tailnet }}"; base_prefix="bullet"; max_count="10"; dry_run="false" }
               $body = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
               Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
               Write-Host "Dispatched STOP."
             } else {
               $payload = @{
                 ts_tailnet      = "${{ inputs.ts_tailnet }}"
-                ts_api_key      = "${{ inputs.ts_api_key }}"
-                ts_authkey      = "${{ inputs.ts_authkey }}"
                 quick_test      = "${{ inputs.quick_test }}"
                 runtime_minutes = "${{ inputs.runtime_minutes }}"
                 do_purge        = "${{ inputs.do_purge }}"
                 cycles          = "$next"
                 rdp_count       = "${{ inputs.rdp_count }}"
                 crd_code        = "${{ inputs.crd_code }}"
-                crd_pin         = "${{ inputs.crd_pin }}"
               }
               $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
               $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
